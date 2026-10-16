@@ -309,12 +309,25 @@ impl RockSize {
             RockSize::Small => 7,
         }
     }
+
+    /// Mass for the bounce, proportional to area. The radii are 4:2:1, so the
+    /// masses come out 16:4:1 and a small rock barely budges a large one.
+    fn mass(self) -> f32 {
+        let r = self.radius() / RockSize::Small.radius();
+        r * r
+    }
 }
 
 pub struct Rock {
     pub pos: Vec2,
     pub vel: Vec2,
     pub size: RockSize,
+    /// Seconds during which this rock ignores other rocks.
+    ///
+    /// Fragments are born on top of their siblings (both start at the parent's
+    /// position), so without a grace period a single break would re-trigger
+    /// every frame and cascade the whole wave down to nothing.
+    pub grace: f32,
     /// Outline in local space, generated once at spawn.
     shape: Vec<Vec2>,
 }
@@ -335,6 +348,9 @@ fn rock_outline(radius: f32) -> Vec<Vec2> {
         .collect()
 }
 
+/// How long a freshly split fragment ignores other rocks.
+pub const FRAGMENT_GRACE: f32 = 0.45;
+
 impl Rock {
     pub fn new(pos: Vec2, size: RockSize) -> Self {
         let (lo, hi) = size.speed_range();
@@ -343,6 +359,7 @@ impl Rock {
             pos,
             vel: dir * rand::gen_range(lo, hi),
             size,
+            grace: 0.0,
             shape: rock_outline(size.radius()),
         }
     }
@@ -362,6 +379,9 @@ impl Rock {
             pos,
             vel: parent_vel * 0.35 + dir * rand::gen_range(lo, hi),
             size,
+            // Long enough for siblings to clear each other before they can
+            // collide, at the slowest fragment speed.
+            grace: FRAGMENT_GRACE,
             shape: rock_outline(size.radius()),
         }
     }
@@ -370,8 +390,19 @@ impl Rock {
         self.size.radius()
     }
 
+    pub fn mass(&self) -> f32 {
+        self.size.mass()
+    }
+
+    /// True once this rock has been clear of its siblings long enough to take
+    /// part in rock-vs-rock collisions.
+    pub fn collidable(&self) -> bool {
+        self.grace <= 0.0
+    }
+
     pub fn update(&mut self, dt: f32) {
         self.pos = wrap(self.pos + self.vel * dt);
+        self.grace = (self.grace - dt).max(0.0);
     }
 
     /// Debris dots for the explosion.
@@ -395,6 +426,62 @@ impl Rock {
         buf.extend(self.shape.iter().map(|&p| self.pos + p));
         render::wrapped_polyline(buf, true, self.pos, self.radius() * 1.15, STROKE, PHOSPHOR);
     }
+}
+
+/// Two rocks touching.
+pub struct Contact {
+    /// Where on the shared surface they met, for sparks or an explosion.
+    pub point: Vec2,
+    /// Closing speed along the contact normal in px/s, i.e. how hard the hit
+    /// was. The caller uses this to decide between a bounce and a break.
+    pub speed: f32,
+}
+
+/// Energy kept across a bounce. Slightly lossy, so a crowded playfield settles
+/// down instead of rattling forever.
+const RESTITUTION: f32 = 0.9;
+
+/// Tests two rocks; if they overlap and are closing, resolves the collision
+/// elastically and reports the contact.
+///
+/// Returns `None` when they are apart, when either is still in its spawn grace
+/// period, or when they overlap but are already moving apart — that last case
+/// matters, because re-resolving a separating pair would trap them together.
+pub fn collide_rocks(a: &mut Rock, b: &mut Rock) -> Option<Contact> {
+    if !a.collidable() || !b.collidable() {
+        return None;
+    }
+
+    let d = torus_delta(a.pos, b.pos); // a -> b, around an edge if nearer
+    let dist = d.length();
+    let min_dist = a.radius() + b.radius();
+    if dist >= min_dist {
+        return None;
+    }
+
+    // Degenerate case: exactly concentric. Any axis will do.
+    let normal = if dist > 1e-4 { d / dist } else { Vec2::X };
+    let closing = -(b.vel - a.vel).dot(normal);
+    if closing <= 0.0 {
+        return None;
+    }
+
+    let (inv_a, inv_b) = (1.0 / a.mass(), 1.0 / b.mass());
+    let impulse = (1.0 + RESTITUTION) * closing / (inv_a + inv_b);
+    a.vel -= normal * (impulse * inv_a);
+    b.vel += normal * (impulse * inv_b);
+
+    // Push them apart so the next frame does not see the same overlap. The
+    // lighter rock gives way, and a little extra clears rounding error.
+    let overlap = min_dist - dist;
+    let share = overlap / (inv_a + inv_b);
+    a.pos = wrap(a.pos - normal * (share * inv_a + 0.25));
+    b.pos = wrap(b.pos + normal * (share * inv_b + 0.25));
+
+    Some(Contact {
+        point: wrap(a.pos + normal * a.radius()),
+        speed: closing,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +754,114 @@ mod tests {
         assert_eq!(frag.pos, parent.pos);
         assert_eq!(frag.radius(), RockSize::Medium.radius());
         assert!(frag.vel.length() > 1.0);
+        // Siblings spawn on top of each other, so they must start inert.
+        assert!(!frag.collidable());
+    }
+
+    /// Builds a rock with an exact position and velocity, bypassing the random
+    /// spawn so collisions can be checked against known numbers.
+    fn rock_at(pos: Vec2, vel: Vec2, size: RockSize) -> Rock {
+        let mut rock = Rock::new(pos, size);
+        rock.vel = vel;
+        rock.grace = 0.0;
+        rock
+    }
+
+    /// Two rocks overlapping and closing head-on along the x axis.
+    fn head_on(a_size: RockSize, b_size: RockSize, speed: f32) -> (Rock, Rock) {
+        let gap = a_size.radius() + b_size.radius() - 4.0; // 4px of overlap
+        let a = rock_at(vec2(400.0, 300.0), vec2(speed, 0.0), a_size);
+        let b = rock_at(vec2(400.0 + gap, 300.0), vec2(-speed, 0.0), b_size);
+        (a, b)
+    }
+
+    #[test]
+    fn rocks_bounce_apart_and_report_the_impact() {
+        let (mut a, mut b) = head_on(RockSize::Medium, RockSize::Medium, 50.0);
+        let contact = collide_rocks(&mut a, &mut b).expect("overlapping and closing");
+
+        // Closing speed is the sum of the two approach speeds.
+        assert!(
+            (contact.speed - 100.0).abs() < 0.01,
+            "speed {}",
+            contact.speed
+        );
+        // Both reversed, and neither gained energy.
+        assert!(a.vel.x < 0.0 && b.vel.x > 0.0);
+        assert!(a.vel.x.abs() <= 50.0 && b.vel.x.abs() <= 50.0);
+        // And they are no longer overlapping, so the next frame is clean.
+        let apart = torus_delta(a.pos, b.pos).length();
+        assert!(
+            apart >= a.radius() + b.radius(),
+            "still overlapping: {apart}"
+        );
+    }
+
+    #[test]
+    fn momentum_is_conserved_and_the_heavy_rock_barely_moves() {
+        let (mut a, mut b) = head_on(RockSize::Large, RockSize::Small, 90.0);
+        let before = a.vel * a.mass() + b.vel * b.mass();
+        let (a_vel, b_vel) = (a.vel, b.vel);
+        collide_rocks(&mut a, &mut b).expect("overlapping and closing");
+
+        let after = a.vel * a.mass() + b.vel * b.mass();
+        assert!(
+            (after - before).length() < 0.01,
+            "momentum changed: {before} -> {after}"
+        );
+        // Masses are 16:1, so the small rock takes almost all of the kick.
+        let (dv_large, dv_small) = ((a.vel - a_vel).length(), (b.vel - b_vel).length());
+        assert!(
+            dv_small > dv_large * 10.0,
+            "large {dv_large}, small {dv_small}"
+        );
+    }
+
+    #[test]
+    fn overlapping_rocks_that_are_separating_are_left_alone() {
+        // Same overlap, but both already heading away from each other.
+        let (mut a, mut b) = head_on(RockSize::Medium, RockSize::Medium, -40.0);
+        assert!(collide_rocks(&mut a, &mut b).is_none());
+        assert_eq!(a.vel.x, -40.0, "velocity must not be touched");
+    }
+
+    #[test]
+    fn fragment_grace_stops_the_cascade() {
+        let (mut a, mut b) = head_on(RockSize::Medium, RockSize::Medium, 50.0);
+        a.grace = FRAGMENT_GRACE;
+        b.grace = FRAGMENT_GRACE;
+        assert!(
+            collide_rocks(&mut a, &mut b).is_none(),
+            "siblings must pass through"
+        );
+
+        // Once the grace has run out they collide normally.
+        for _ in 0..((FRAGMENT_GRACE * 60.0) as i32 + 2) {
+            a.update(1.0 / 60.0);
+            b.update(1.0 / 60.0);
+        }
+        assert!(a.collidable() && b.collidable());
+        // Put them back on a collision course now that they have drifted.
+        let (mut a, mut b) = head_on(RockSize::Medium, RockSize::Medium, 50.0);
+        assert!(collide_rocks(&mut a, &mut b).is_some());
+    }
+
+    #[test]
+    fn rocks_collide_across_the_wrap() {
+        let a = rock_at(vec2(4.0, 300.0), vec2(-60.0, 0.0), RockSize::Medium);
+        let b = rock_at(vec2(W - 8.0, 300.0), vec2(60.0, 0.0), RockSize::Medium);
+        let (mut a, mut b) = (a, b);
+        let contact = collide_rocks(&mut a, &mut b).expect("touching around the edge");
+        assert!((contact.speed - 120.0).abs() < 0.01);
+        // `a` is pushed back to the right (+x), `b` to the left.
+        assert!(a.vel.x > 0.0 && b.vel.x < 0.0);
+    }
+
+    #[test]
+    fn distant_rocks_do_not_interact() {
+        let mut a = rock_at(vec2(200.0, 300.0), vec2(80.0, 0.0), RockSize::Large);
+        let mut b = rock_at(vec2(600.0, 300.0), vec2(-80.0, 0.0), RockSize::Large);
+        assert!(collide_rocks(&mut a, &mut b).is_none());
     }
 
     #[test]

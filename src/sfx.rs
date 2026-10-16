@@ -368,6 +368,12 @@ impl SoundBank {
         self.one_shot(&self.ship_explode, 0.9);
     }
 
+    /// Two rocks knocking together: the small bang, played quietly so a busy
+    /// playfield clatters in the background instead of shouting.
+    pub fn thud(&self) {
+        self.one_shot(&self.bang_small, 0.22);
+    }
+
     pub fn extra_life(&self) {
         self.one_shot(&self.extra_life, 0.7);
     }

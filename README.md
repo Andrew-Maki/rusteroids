@@ -5,7 +5,8 @@ A clone of Atari's 1979 arcade game **Asteroids**, written from scratch in Rust.
 It aims at the feel of the original cabinet rather than a modern remake: a
 monochrome vector playfield on a toroidal screen, momentum you have to fight,
 four shots in the air at a time, and the two-note heartbeat that speeds up as
-the rocks thin out.
+the rocks thin out. There is also a **hard mode** that breaks with the original
+and lets the rocks smash each other apart.
 
 Everything on screen and everything you hear is generated at runtime — there
 are no image, font or audio files anywhere in the project:
@@ -72,17 +73,42 @@ cargo test
 
 | Action | Keys |
 | --- | --- |
+| Start — original mode | `Space` or `Enter` |
+| Start — hard mode | `H` |
 | Rotate | `Left` / `Right`, or `A` / `D` |
 | Thrust | `Up` or `W` |
 | Fire | `Space` |
 | Hyperspace | `Shift`, or `Down` / `S` |
-| Start game | `Space` or `Enter` |
 | Pause | `P` |
 | Mute | `M` |
 | Abandon game / quit | `Esc` |
 
 `Esc` drops you from a game back to the title screen; pressing it again on the
 title screen exits.
+
+## Two modes
+
+The mode is chosen at the title screen and fixed for the run. Each keeps its own
+high score, because the two are not comparable.
+
+**Original** (`Space`) is the arcade rule set: rocks drift straight through one
+another, and the only thing that breaks a rock is a bullet.
+
+**Hard** (`H`) makes rocks collide with each other. They bounce elastically —
+mass goes as area, so a small rock barely shifts a large one — and shatter when
+the closing speed is high enough. Because collisions pay no score, the playfield
+fills with fast fragments you were never paid for, which is what makes it the
+harder game.
+
+It also produces a pleasing escalation: two large rocks can only close at
+124 px/s and mostly just clatter off each other, but the medium and small
+fragments you create by shooting travel at up to 104 and 158, so the more you
+shoot, the more the rocks start demolishing each other. Small rocks have nothing
+to break into, so they only ever bounce — a wave can never finish itself, and the
+last few rocks are always yours to shoot.
+
+Tune `ROCK_BREAK_SPEED` in `src/game.rs` to taste: lower is more destructive,
+higher is more clattering.
 
 ## How it plays
 
@@ -93,6 +119,8 @@ title screen exits.
 - **Waves** start with four large rocks and add two more each wave, capped at
   eleven. Large rocks break into two medium, medium into two small, and small
   ones vaporise. Fragments fly faster than their parent.
+- **Rocks collide with each other in hard mode only** (see above). In original
+  mode they pass straight through, as they did in the arcade.
 - **Saucers** cross the screen on a staircase path. The large one sprays shots
   at random; the small one aims at you, and its accuracy improves as your score
   climbs. A saucer that flies into a rock destroys both and scores you nothing.
@@ -112,8 +140,8 @@ title screen exits.
 | Large saucer | 200 |
 | Small saucer | 1,000 |
 
-Rocks broken by a saucer's shots score nothing — you have to land the hit
-yourself.
+Rocks broken by a saucer's shots, or by crashing into each other in hard mode,
+score nothing — you have to land the hit yourself.
 
 ## Project layout
 

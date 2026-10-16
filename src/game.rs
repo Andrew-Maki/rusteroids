@@ -11,7 +11,7 @@ use macroquad::prelude::*;
 
 use crate::entity::{
     BULLET_LIFE, BULLET_R, BULLET_SPEED, Bullet, Dot, Piece, Rock, RockSize, SHIP_R, Saucer, Ship,
-    hits, random_edge_point, random_point, torus_delta,
+    collide_rocks, hits, random_edge_point, random_point, torus_delta,
 };
 use crate::render::STROKE;
 use crate::sfx::SoundBank;
@@ -38,6 +38,21 @@ const RESPAWN_INVULN: f32 = 2.0;
 /// Seconds between waves, so the last explosion can finish.
 const WAVE_GAP: f32 = 1.7;
 
+/// Closing speed at which a rock-vs-rock impact stops being a bounce and
+/// becomes a break.
+///
+/// Worth checking against `RockSize::speed_range`: large rocks travel at
+/// 26-62, medium at 46-104 and small at 74-158. So two large rocks can only
+/// reach 124 and break each other on a near-flat-out head-on, while the fast
+/// fragments you create by shooting will happily demolish them. Lower this to
+/// make the playfield more destructive, raise it for more clattering.
+const ROCK_BREAK_SPEED: f32 = 115.0;
+/// Impacts softer than this are silent and sparkless; without it, rocks that
+/// are barely touching produce a constant drizzle of debris.
+const ROCK_SPARK_SPEED: f32 = 45.0;
+/// Minimum gap between impact sounds, so a pile-up cannot machine-gun them.
+const THUD_COOLDOWN: f32 = 0.09;
+
 enum State {
     Attract,
     Playing,
@@ -46,8 +61,34 @@ enum State {
     GameOver,
 }
 
+/// Chosen on the title screen, fixed for the run.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// The arcade rules: rocks drift straight through each other.
+    Original,
+    /// Rocks bounce off each other and shatter on hard impacts, so the
+    /// playfield fills with fast fragments you were never paid for.
+    Hard,
+}
+
+impl Mode {
+    /// Index into the per-mode high score table.
+    fn index(self) -> usize {
+        match self {
+            Mode::Original => 0,
+            Mode::Hard => 1,
+        }
+    }
+
+    fn rocks_collide(self) -> bool {
+        matches!(self, Mode::Hard)
+    }
+}
+
 pub struct Game {
     state: State,
+    /// Rules for the current run, picked on the title screen.
+    mode: Mode,
     /// Countdown used by `Dying` and `GameOver`.
     timer: f32,
 
@@ -59,7 +100,9 @@ pub struct Game {
     pieces: Vec<Piece>,
 
     score: u32,
-    high_score: u32,
+    /// One high score per mode: hard mode destroys rocks without paying for
+    /// them, so the two are not comparable.
+    high_scores: [u32; 2],
     lives: i32,
     wave: u32,
     next_extra_life: u32,
@@ -73,6 +116,7 @@ pub struct Game {
     wave_gap: f32,
     fire_timer: f32,
     hyperspace_timer: f32,
+    thud_timer: f32,
 
     paused: bool,
     quit: bool,
@@ -83,6 +127,7 @@ impl Game {
     pub async fn new() -> Self {
         let mut game = Self {
             state: State::Attract,
+            mode: Mode::Original,
             timer: 0.0,
             ship: None,
             rocks: Vec::new(),
@@ -91,7 +136,7 @@ impl Game {
             dots: Vec::new(),
             pieces: Vec::new(),
             score: 0,
-            high_score: 0,
+            high_scores: [0; 2],
             lives: 0,
             wave: 0,
             next_extra_life: EXTRA_LIFE_EVERY,
@@ -102,6 +147,7 @@ impl Game {
             wave_gap: 0.0,
             fire_timer: 0.0,
             hyperspace_timer: 0.0,
+            thud_timer: 0.0,
             paused: false,
             quit: false,
             sfx: SoundBank::load_all().await,
@@ -153,8 +199,15 @@ impl Game {
         }
     }
 
-    fn start_pressed() -> bool {
-        is_key_pressed(KeyCode::Space) || is_key_pressed(KeyCode::Enter)
+    /// Which mode the player just asked to start, if any.
+    fn start_input() -> Option<Mode> {
+        if is_key_pressed(KeyCode::Space) || is_key_pressed(KeyCode::Enter) {
+            Some(Mode::Original)
+        } else if is_key_pressed(KeyCode::H) {
+            Some(Mode::Hard)
+        } else {
+            None
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -185,8 +238,13 @@ impl Game {
         for rock in &mut self.rocks {
             rock.update(dt);
         }
-        if Self::start_pressed() {
-            self.new_game();
+        // The title-screen rocks always bounce, whichever mode is about to be
+        // picked: it previews hard mode and keeps the backdrop lively. They
+        // never break, so the same handful of shapes drifts for as long as the
+        // screen is up.
+        self.rocks_vs_rocks(dt, false);
+        if let Some(mode) = Self::start_input() {
+            self.new_game(mode);
         }
     }
 
@@ -194,7 +252,8 @@ impl Game {
     // A new game
     // -----------------------------------------------------------------------
 
-    fn new_game(&mut self) {
+    fn new_game(&mut self, mode: Mode) {
+        self.mode = mode;
         self.score = 0;
         self.lives = START_LIVES;
         self.wave = 0;
@@ -247,7 +306,7 @@ impl Game {
     fn update_playing(&mut self, dt: f32) {
         self.control_ship(dt);
         self.step_world(dt);
-        self.collide();
+        self.collide(dt);
         self.update_saucer(dt, true);
         self.heartbeat(dt);
 
@@ -375,12 +434,79 @@ impl Game {
     // Collisions
     // -----------------------------------------------------------------------
 
-    fn collide(&mut self) {
+    fn collide(&mut self, dt: f32) {
+        // Rocks first, so everything else tests against post-bounce positions.
+        if self.mode.rocks_collide() {
+            self.rocks_vs_rocks(dt, true);
+        }
         self.bullets_vs_rocks();
         self.bullets_vs_saucer();
         self.bullets_vs_ship();
         self.saucer_vs_rocks();
         self.ship_vs_world();
+    }
+
+    /// Rocks bounce off each other, and shatter when the hit is hard enough.
+    ///
+    /// Only called in hard mode, apart from the attract screen. `may_shatter`
+    /// is false there, where the rocks are scenery and should just clatter
+    /// around indefinitely.
+    ///
+    /// The pair loop is O(n²), but n is capped at a few dozen even in a late
+    /// wave, so a broad phase would cost more than it saves.
+    fn rocks_vs_rocks(&mut self, dt: f32, may_shatter: bool) {
+        let mut shatter: Vec<usize> = Vec::new();
+        let mut loudest: Option<(Vec2, f32)> = None;
+
+        for i in 0..self.rocks.len() {
+            for j in (i + 1)..self.rocks.len() {
+                // Disjoint borrows of two elements of the same Vec.
+                let (head, tail) = self.rocks.split_at_mut(j);
+                let Some(contact) = collide_rocks(&mut head[i], &mut tail[0]) else {
+                    continue;
+                };
+
+                if contact.speed >= ROCK_SPARK_SPEED
+                    && loudest.is_none_or(|(_, s)| contact.speed > s)
+                {
+                    loudest = Some((contact.point, contact.speed));
+                }
+                if may_shatter && contact.speed >= ROCK_BREAK_SPEED {
+                    // A small rock has nothing to break into, so it only ever
+                    // bounces — otherwise small-vs-small would vaporise both
+                    // and a wave could finish itself without the player.
+                    for k in [i, j] {
+                        if self.rocks[k].size.smaller().is_some() && !shatter.contains(&k) {
+                            shatter.push(k);
+                        }
+                    }
+                }
+            }
+        }
+
+        // One sound and one spark per frame, from the biggest impact, so a
+        // pile-up does not turn into a wall of noise. A hit hard enough to
+        // shatter needs neither: the explosion covers it.
+        self.thud_timer = (self.thud_timer - dt).max(0.0);
+        if let Some((point, speed)) = loudest {
+            let shattered = may_shatter && speed >= ROCK_BREAK_SPEED;
+            if !shattered {
+                let n = (speed / 60.0).clamp(1.0, 4.0) as usize;
+                self.spray(point, n, (25.0, 70.0), 0.25);
+                if self.thud_timer == 0.0 {
+                    self.sfx.thud();
+                    self.thud_timer = THUD_COOLDOWN;
+                }
+            }
+        }
+
+        // Descending order: `swap_remove` only ever moves an element from the
+        // tail, which is past every index still waiting to be processed.
+        shatter.sort_unstable_by(|a, b| b.cmp(a));
+        for index in shatter {
+            // Collisions award nothing — the player has to land the hit.
+            self.destroy_rock(index, false);
+        }
     }
 
     fn bullets_vs_rocks(&mut self) {
@@ -522,12 +648,21 @@ impl Game {
 
     fn add_score(&mut self, points: u32) {
         self.score += points;
-        self.high_score = self.high_score.max(self.score);
+        self.record_high_score();
         while self.score >= self.next_extra_life {
             self.lives += 1;
             self.next_extra_life += EXTRA_LIFE_EVERY;
             self.sfx.extra_life();
         }
+    }
+
+    fn high_score(&self) -> u32 {
+        self.high_scores[self.mode.index()]
+    }
+
+    fn record_high_score(&mut self) {
+        let slot = &mut self.high_scores[self.mode.index()];
+        *slot = (*slot).max(self.score);
     }
 
     // -----------------------------------------------------------------------
@@ -536,7 +671,11 @@ impl Game {
 
     fn update_dying(&mut self, dt: f32) {
         self.step_world(dt);
-        // Rocks and saucers keep fighting each other while the player is out.
+        // Rocks and saucers keep knocking each other about while the player
+        // is out of the game.
+        if self.mode.rocks_collide() {
+            self.rocks_vs_rocks(dt, true);
+        }
         self.bullets_vs_rocks();
         self.saucer_vs_rocks();
         self.update_saucer(dt, false);
@@ -562,7 +701,7 @@ impl Game {
         } else {
             self.state = State::GameOver;
             self.timer = 6.0;
-            self.high_score = self.high_score.max(self.score);
+            self.record_high_score();
             self.sfx.silence_loops();
         }
     }
@@ -586,7 +725,7 @@ impl Game {
             rock.update(dt);
         }
         self.timer -= dt;
-        if self.timer <= 0.0 || Self::start_pressed() {
+        if self.timer <= 0.0 || Self::start_input().is_some() {
             self.enter_attract();
         }
     }
@@ -642,7 +781,7 @@ impl Game {
             Ship::draw_icon(buf, vec2(38.0 + i as f32 * 26.0, 84.0), 0.8);
         }
 
-        let high = format!("HIGH {}", self.high_score);
+        let high = format!("HIGH {}", self.high_score());
         font::draw_centered(&high, W * 0.5, 26.0, 18.0, STROKE * 0.75, dim(0.6));
 
         let wave = format!("WAVE {}", self.wave);
@@ -655,21 +794,70 @@ impl Game {
             STROKE * 0.75,
             dim(0.6),
         );
+
+        // Badge under the wave counter, so a screenshot says which rules were
+        // in play. Original mode is the default and needs no label.
+        if self.mode == Mode::Hard {
+            let label = "HARD";
+            let size = 15.0;
+            font::draw(
+                label,
+                W - 26.0 - font::text_width(label, size),
+                52.0,
+                size,
+                STROKE * 0.7,
+                dim(0.75),
+            );
+        }
     }
 
     fn draw_attract(&self) {
-        font::draw_centered("RUSTEROIDS", W * 0.5, H * 0.22, 72.0, STROKE * 1.3, PHOSPHOR);
+        font::draw_centered(
+            "RUSTEROIDS",
+            W * 0.5,
+            H * 0.17,
+            72.0,
+            STROKE * 1.3,
+            PHOSPHOR,
+        );
 
+        // Two ways in. Space blinks because it is the default; hard mode sits
+        // underneath it, with a line each explaining the difference.
         if blink(1.0, 0.62) {
             font::draw_centered(
                 "PRESS SPACE TO PLAY",
                 W * 0.5,
-                H * 0.44,
+                H * 0.33,
                 26.0,
                 STROKE,
                 PHOSPHOR,
             );
         }
+        font::draw_centered(
+            "ORIGINAL ARCADE RULES",
+            W * 0.5,
+            H * 0.385,
+            15.0,
+            STROKE * 0.7,
+            dim(0.5),
+        );
+
+        font::draw_centered(
+            "PRESS H FOR HARD MODE",
+            W * 0.5,
+            H * 0.45,
+            22.0,
+            STROKE * 0.9,
+            dim(0.9),
+        );
+        font::draw_centered(
+            "ROCKS COLLIDE AND SMASH EACH OTHER APART",
+            W * 0.5,
+            H * 0.505,
+            15.0,
+            STROKE * 0.7,
+            dim(0.5),
+        );
 
         let rows = [
             ("ROTATE", "LEFT / RIGHT"),
@@ -681,7 +869,7 @@ impl Game {
         ];
         let size = 16.0;
         let line = size * 1.75;
-        let top = H * 0.56;
+        let top = H * 0.60;
         for (i, (action, keys)) in rows.iter().enumerate() {
             let y = top + i as f32 * line;
             let label_right = W * 0.5 - 18.0;
@@ -696,21 +884,38 @@ impl Game {
             font::draw(keys, W * 0.5 + 18.0, y, size, STROKE * 0.7, dim(0.8));
         }
 
-        if self.high_score > 0 {
-            let s = format!("HIGH SCORE {}", self.high_score);
-            font::draw_centered(&s, W * 0.5, H - 56.0, 18.0, STROKE * 0.75, dim(0.6));
+        // A high score per mode, since the two are not comparable.
+        let mut y = H - 72.0;
+        for (label, mode) in [("HIGH SCORE", Mode::Original), ("HARD MODE", Mode::Hard)] {
+            let best = self.high_scores[mode.index()];
+            if best == 0 {
+                continue;
+            }
+            let s = format!("{label} {best}");
+            font::draw_centered(&s, W * 0.5, y, 17.0, STROKE * 0.75, dim(0.6));
+            y += 26.0;
         }
     }
 
     fn draw_game_over(&self) {
-        font::draw_centered("GAME OVER", W * 0.5, H * 0.38, 54.0, STROKE * 1.2, PHOSPHOR);
+        font::draw_centered("GAME OVER", W * 0.5, H * 0.36, 54.0, STROKE * 1.2, PHOSPHOR);
+        if self.mode == Mode::Hard {
+            font::draw_centered(
+                "HARD MODE",
+                W * 0.5,
+                H * 0.46,
+                18.0,
+                STROKE * 0.75,
+                dim(0.6),
+            );
+        }
         let s = format!("SCORE {}", self.score);
-        font::draw_centered(&s, W * 0.5, H * 0.52, 24.0, STROKE, dim(0.8));
-        if self.score >= self.high_score && self.score > 0 && blink(0.9, 0.55) {
+        font::draw_centered(&s, W * 0.5, H * 0.53, 24.0, STROKE, dim(0.8));
+        if self.score >= self.high_score() && self.score > 0 && blink(0.9, 0.55) {
             font::draw_centered(
                 "NEW HIGH SCORE",
                 W * 0.5,
-                H * 0.60,
+                H * 0.61,
                 20.0,
                 STROKE * 0.8,
                 PHOSPHOR,
@@ -718,7 +923,7 @@ impl Game {
         }
         if blink(1.0, 0.62) {
             font::draw_centered(
-                "PRESS SPACE",
+                "PRESS SPACE OR H",
                 W * 0.5,
                 H * 0.72,
                 20.0,
