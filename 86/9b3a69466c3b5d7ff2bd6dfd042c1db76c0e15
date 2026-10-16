@@ -1,0 +1,62 @@
+src/sfx.rs
+  s_97e0d44646825a::t_7d0d09e639d491 413-416,418-420
+  s_97e0d44646825a::t_83e559bfa437c9 82-83
+  s_97e0d44646825a::t_6bb25448f82e99 158
+  s_3765c11dccc6cd::t_58d35b358a4297 1-81,84-157,159-251,253-302,306-344,352-393,401-412,417,428-432,438-445
+  s_97e0d44646825a::t_31e0bf6ea5b2d2 252
+  s_97e0d44646825a::t_be7666d463bf07 303-305,345-351,394-400,421-427,433-437
+src/render.rs
+  s_3765c11dccc6cd::t_d4b15e272ac6c0 1-104
+src/game.rs
+  s_97e0d44646825a::t_57402ac1199c28 472-479
+  s_97e0d44646825a::t_388a1a6c27cfa2 661
+  s_97e0d44646825a::t_b2561a4140fbf0 1-12,15-17,19-220,223-281,288-328,330,336-442,448-462,468-471,480-660,662-709,718-719,728-740
+  s_97e0d44646825a::t_be7666d463bf07 13-14,18,221-222,282-287,443-447,463-467,710-717,720-727
+  s_97e0d44646825a::t_0bf3ec680786c3 329,331-335
+Cargo.toml
+  s_97e0d44646825a::t_c86e95be209305 2
+  s_3765c11dccc6cd::t_d0b6abda196ca5 8-14
+  s_3765c11dccc6cd::t_394fb1feffda0b 7
+  s_3765c11dccc6cd::t_74255454ae966e 1,3-6
+src/font.rs
+  s_3765c11dccc6cd::t_1bad872d92ad5e 1-120
+src/main.rs
+  s_97e0d44646825a::t_c67f58d87a347b 1
+  s_97e0d44646825a::t_54f15bb85b687d 45-59,78,83
+  s_97e0d44646825a::t_cc9af630a43850 33
+  s_97e0d44646825a::t_341396b3018be5 2-32,34-44,60-77,79-82
+src/entity.rs
+  s_97e0d44646825a::t_be7666d463bf07 230-235,482-486,568-572
+  s_97e0d44646825a::t_83066edd8841e9 1-229,236-253,255-481,487-567,573-603
+  s_97e0d44646825a::t_d7981120684656 604-635,640-686,691-733
+  s_97e0d44646825a::t_c4908cf5d32da7 636-639,687-690
+  s_97e0d44646825a::t_db08d335366eb3 254
+README.md
+  s_97e0d44646825a::t_d2a3b18fd6f6eb 1-138
+Cargo.lock
+  s_97e0d44646825a::t_a9a65614d2d689 1-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "869b3a69466c3b5d7ff2bd6dfd042c1db76c0e15",
+  "prompts": {},
+  "sessions": {
+    "s_3765c11dccc6cd": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eba6251d0ffelBVd3jJt3quXbI",
+        "model": "unknown"
+      },
+      "human_author": "AndrewMaki <andrew.maki@coupa.com>"
+    },
+    "s_97e0d44646825a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eba4c9d5fffe3W9GLDc8K7z22U",
+        "model": "unknown"
+      },
+      "human_author": "AndrewMaki <andrew.maki@coupa.com>"
+    }
+  }
+}
